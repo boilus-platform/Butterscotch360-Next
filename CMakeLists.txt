@@ -15,7 +15,7 @@ if(PLATFORM STREQUAL "vita")
 
     set(BACKEND "sdl2")
 
-    elseif(PLATFORM STREQUAL "switch")
+elseif(PLATFORM STREQUAL "switch")
     if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
         if(NOT DEFINED ENV{DEVKITPRO})
             message(FATAL_ERROR "Please define DEVKITPRO to point to your SDK path!")
@@ -23,6 +23,9 @@ if(PLATFORM STREQUAL "vita")
         set(CMAKE_TOOLCHAIN_FILE "$ENV{DEVKITPRO}/cmake/Switch.cmake" CACHE PATH "toolchain file")
     endif()
 
+    set(BACKEND "sdl2")
+
+elseif(PLATFORM STREQUAL "webos")
     set(BACKEND "sdl2")
 endif()
 
@@ -115,12 +118,13 @@ option(ENABLE_WAD14 "Enable support for WAD Version 14 and below" ON)
 option(ENABLE_WAD16 "Enable support for WAD Version 15/16" ON)
 option(ENABLE_WAD17 "Enable support for WAD Version 17" ON)
 option(ENABLE_LEGACY_GL "Enable the legacy OpenGL renderer" ON)
-if(PLATFORM STREQUAL "switch" OR PLATFORM STREQUAL "web")
+if(PLATFORM STREQUAL "switch" OR PLATFORM STREQUAL "webos" OR PLATFORM STREQUAL "web")
     set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer" FORCE)
 endif()
 option(ENABLE_MODERN_GL "Enable the modern OpenGL renderer" ON)
 option(ENABLE_NOOP_RENDERER "Enable the no-op renderer (headless stub, no drawing)" OFF)
 option(ENABLE_PHYSICS "Enable Box2D physics support" ON)
+option(ENABLE_FMOD "Enable standalone FMOD bank/event compatibility" ON)
 # Noop renderer is exclusive to the noop desktop backend (no window, no GL).
 # Auto-enable for BACKEND=noop and reject otherwise.
 if(BACKEND STREQUAL "noop")
@@ -155,8 +159,14 @@ endif()
 if(ENABLE_PHYSICS)
     add_compile_definitions(ENABLE_PHYSICS)
 endif()
+if(ENABLE_FMOD)
+    add_compile_definitions(ENABLE_FMOD)
+endif()
 
 file(GLOB SOURCES src/*.c)
+if(ENABLE_FMOD)
+    list(APPEND SOURCES src/fmod/fmod.c src/fmod/fmod_bank.c src/fmod/fsb.c src/fmod/fmod_dsp.c)
+endif()
 if(ENABLE_PHYSICS)
     file(GLOB PHYSICS_SOURCES CONFIGURE_DEPENDS src/physics/*.c)
 else()
@@ -378,8 +388,14 @@ if(ENABLE_VM_EXCEPTIONS_LOGS)
     add_compile_definitions(ENABLE_VM_EXCEPTIONS_LOGS)
 endif()
 
-if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "switch" OR PLATFORM STREQUAL "web")
-    if(PLATFORM STREQUAL "vita")
+if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "switch" OR PLATFORM STREQUAL "webos" OR PLATFORM STREQUAL "web")
+    if(PLATFORM STREQUAL "webos")
+        set(VM_GML_PROFILER_DEFAULT OFF)
+        set(VM_TRACING_DEFAULT OFF)
+        set(VM_OPCODE_PROFILER_DEFAULT OFF)
+        set(VM_STUB_LOGS_DEFAULT OFF)
+        set(ENABLE_FILE_PICKER OFF)
+    elseif(PLATFORM STREQUAL "vita")
         # Normally, __VITA__ should already be defined, but for some reason,
         # in my case, this didn't really work... so just in case, when we're
         # building for the Vita, just force-feed these...
@@ -390,6 +406,7 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
         set(VM_TRACING_DEFAULT OFF)
         set(VM_OPCODE_PROFILER_DEFAULT OFF)
         set(VM_STUB_LOGS_DEFAULT OFF)
+        set(ENABLE_FILE_PICKER OFF)
     elseif(PLATFORM STREQUAL "switch")
         add_compile_definitions(PLATFORM_SWITCH)
 
@@ -397,6 +414,7 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
         set(VM_TRACING_DEFAULT OFF)
         set(VM_OPCODE_PROFILER_DEFAULT OFF)
         set(VM_STUB_LOGS_DEFAULT OFF)
+        set(ENABLE_FILE_PICKER OFF)
     elseif(PLATFORM STREQUAL "web")
         add_compile_definitions(PLATFORM_WEB)
         target_sources(butterscotch PRIVATE src/cli/args.c)
@@ -405,6 +423,7 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
         set(VM_TRACING_DEFAULT ON)
         set(VM_OPCODE_PROFILER_DEFAULT ON)
         set(VM_STUB_LOGS_DEFAULT ON)
+        set(ENABLE_FILE_PICKER ON)
     endif()
     # Matches the GitHub Actions container flags (FORTIFY requires building with optimizations enabled!)
     target_compile_options(butterscotch PRIVATE "$<$<CONFIG:Release,RelWithDebInfo>:-U_FORTIFY_SOURCE;-D_FORTIFY_SOURCE=2>")
@@ -459,8 +478,20 @@ if(PLATFORM STREQUAL "cli" OR PLATFORM STREQUAL "vita" OR PLATFORM STREQUAL "swi
         add_compile_definitions(ENABLE_VM_STUB_LOGS)
     endif()
 
+    # File Picker
+    option(ENABLE_FILE_PICKER "Enable file picker" ${VM_STUB_LOGS_DEFAULT})
+    if(ENABLE_FILE_PICKER)
+        add_compile_definitions(ENABLE_FILE_PICKER)
+    endif()
+
     # stb_image
     target_include_directories(butterscotch PUBLIC vendor/stb/image)
+
+    if (ENABLE_FILE_PICKER)
+        # tinyfd
+        target_sources(butterscotch PRIVATE vendor/tinyfd/tinyfiledialogs.c)
+        target_include_directories(butterscotch PUBLIC vendor/tinyfiledialogs)
+    endif()
 
     set(PLATFORM_LIBRARIES bzip2 stb_ds sha1 stb_vorbis)
     if(NOT PLATFORM STREQUAL "vita" AND NOT PLATFORM STREQUAL "switch")

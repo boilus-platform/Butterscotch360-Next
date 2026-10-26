@@ -6,6 +6,7 @@
 
 #include "stb_vorbis.c"
 #include "al_audio_system.h"
+#include "fmod/fmod.h"
 #include "binary_utils.h"
 #include "data_win.h"
 #include "utils.h"
@@ -39,6 +40,25 @@ static bool alSourceIsLooping(ALuint source) {
     ALint state;
     alGetSourcei(source, AL_LOOPING, &state);
     return state != AL_FALSE;
+}
+
+static bool isInstancePlaying(const SoundInstance* inst) {
+    return !inst->paused && (inst->pendingStart || inst->streaming || alSourceIsPlaying(inst->alSource));
+}
+
+static void pauseInstance(SoundInstance* inst) {
+    inst->pendingStart = false;
+    inst->paused = true;
+    alSourcePause(inst->alSource);
+}
+
+static void startInstance(SoundInstance* inst) {
+    inst->paused = false;
+    if (alSourceIsPlaying(inst->alSource)) return;
+    if (inst->streaming)
+        inst->pendingStart = true;
+    else
+        alSourcePlay(inst->alSource);
 }
 
 // Source - https://stackoverflow.com/a/7995655
@@ -237,6 +257,7 @@ static void maInit(AudioSystem* audio, DataWin* dataWin, FileSystem* fileSystem)
 }
 
 static void maDestroy(AudioSystem* audio) {
+    Fmod_audioDestroy(audio);
     AlAudioSystem* ma = (AlAudioSystem*) audio;
 
     free(audio->groupGains);
@@ -326,8 +347,8 @@ static void maUpdate(AudioSystem* audio, float deltaTime) {
 
             // Underrun recovery: AL goes to AL_STOPPED if the queue runs dry.
             // Kick it back on as soon as we have buffers queued again.
-            if (alSourceHasStopped(inst->alSource) && queued > 0) {
-                alSourcePlay(inst->alSource);
+            if (!inst->paused && alSourceHasStopped(inst->alSource) && queued > 0) {
+                inst->pendingStart = true;
             }
             continue;
         }
@@ -335,6 +356,27 @@ static void maUpdate(AudioSystem* audio, float deltaTime) {
         // Clean up ended non-looping sounds (ma_sound_at_end avoids reaping still-loading async sounds)
         if (alSourceHasStopped(inst->alSource) && !alSourceIsLooping(inst->alSource)) {
             releaseInstance(inst);
+        }
+    }
+
+    // finish loading and refilling before starting this frame's streams together
+    ALuint sources[MAX_SOUND_INSTANCES];
+    ALsizei sourceCount = 0;
+    repeat(MAX_SOUND_INSTANCES, i) {
+        SoundInstance* inst = &ma->instances[i];
+        if (inst->active && inst->pendingStart && !inst->paused)
+            sources[sourceCount++] = inst->alSource;
+    }
+    if (sourceCount > 0) {
+        (void)alGetError();
+        alSourcePlayv(sourceCount, sources);
+        if (alGetError() == AL_NO_ERROR) {
+            repeat(MAX_SOUND_INSTANCES, i) {
+                SoundInstance* inst = &ma->instances[i];
+                if (inst->active && !inst->paused) inst->pendingStart = false;
+            }
+        } else {
+            logWarn("Audio: alSourcePlayv failed for stream starts\n");
         }
     }
 }
@@ -434,6 +476,64 @@ static FILE* openWavStream(const char* path, int32_t* outChannels, int32_t* outS
     return f;
 }
 
+static int32_t alPlayEncoded(AudioSystem* audio, const uint8_t* data, size_t bytes, bool loop) {
+    AlAudioSystem* al = (AlAudioSystem*) audio;
+    if (!data || !bytes || bytes > INT32_MAX || !al->alContext) return -1;
+    SoundInstance* slot = findFreeSlot(al);
+    if (!slot) return -1;
+    int error = 0;
+    stb_vorbis* decoder = stb_vorbis_open_memory(data, (int) bytes, &error, nullptr);
+    if (!decoder) return -1;
+    stb_vorbis_info info = stb_vorbis_get_info(decoder);
+    if (info.channels < 1 || info.channels > 2 || info.sample_rate == 0) {
+        stb_vorbis_close(decoder);
+        return -1;
+    }
+    memset(slot, 0, sizeof(*slot));
+    slot->active = true;
+    slot->streaming = true;
+    slot->loop = loop;
+    slot->vorbis = decoder;
+    slot->soundIndex = -1;
+    slot->instanceId = SOUND_INSTANCE_ID_BASE + al->nextInstanceCounter++;
+    slot->streamChannels = info.channels;
+    slot->streamSampleRate = (int) info.sample_rate;
+    slot->streamFormat = info.channels == 2 ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
+    slot->streamLengthSamples = stb_vorbis_stream_length_in_samples(decoder);
+    slot->streamLengthSeconds = (float) slot->streamLengthSamples / info.sample_rate;
+    slot->currentGain = slot->targetGain = slot->startGain = 1;
+    slot->decodeScratch = (int16_t*) malloc(AL_STREAM_BUFFER_SAMPLES * info.channels * sizeof(int16_t));
+    if (!slot->decodeScratch) {
+        stb_vorbis_close(decoder);
+        slot->active = false;
+        return -1;
+    }
+    alGetError();
+    alGenSources(1, &slot->alSource);
+    alGenBuffers(AL_STREAM_BUFFER_COUNT, slot->streamBuffers);
+    if (alGetError() != AL_NO_ERROR) {
+        releaseInstance(slot);
+        return -1;
+    }
+    alSourcei(slot->alSource, AL_SOURCE_RELATIVE, AL_TRUE);
+    alSourcef(slot->alSource, AL_GAIN, 1);
+    int queued = 0;
+    for (int i = 0; i < AL_STREAM_BUFFER_COUNT; i++) {
+        if (!streamFillBuffer(slot, slot->streamBuffers[i])) {
+            slot->streamEnded = true;
+            break;
+        }
+        alSourceQueueBuffers(slot->alSource, 1, &slot->streamBuffers[i]);
+        queued++;
+    }
+    if (!queued || alGetError() != AL_NO_ERROR) {
+        releaseInstance(slot);
+        return -1;
+    }
+    alSourcePlay(slot->alSource);
+    return slot->instanceId;
+}
+
 static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t priority, bool loop) {
     AlAudioSystem* ma = (AlAudioSystem*) audio;
 
@@ -470,6 +570,8 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
     }
 
     slot->streaming = false;
+    slot->pendingStart = false;
+    slot->paused = false;
     slot->vorbis = nullptr;
     slot->wavFile = nullptr;
     slot->decodeScratch = nullptr;
@@ -739,9 +841,13 @@ static int32_t maPlaySound(AudioSystem* audio, int32_t soundIndex, int32_t prior
     // Track unique IDs for disambiguation
     ma->nextInstanceCounter++;
 
-    alSourcePlay(slot->alSource);
-    if (alGetError() != AL_NO_ERROR) {
-        logWarn("Audio: alSourcePlay failed for sound %d (stream=%d)\n", soundIndex, isStream);
+    if (isStream) {
+        slot->pendingStart = true;
+    } else {
+        alSourcePlay(slot->alSource);
+        if (alGetError() != AL_NO_ERROR) {
+            logWarn("Audio: alSourcePlay failed for sound %d (stream=%d)\n", soundIndex, isStream);
+        }
     }
 
     return slot->instanceId;
@@ -784,7 +890,9 @@ static void maStopAll(AudioSystem* audio) {
     AlAudioSystem* ma = (AlAudioSystem*) audio;
 
     repeat(MAX_SOUND_INSTANCES, i) {
-        releaseInstance(&ma->instances[i]);
+        SoundInstance* inst = &ma->instances[i];
+        // encoded voices have separate control ownership.
+        if (inst->soundIndex >= 0) releaseInstance(inst);
     }
 }
 
@@ -796,18 +904,13 @@ static bool maIsPlaying(AudioSystem* audio, int32_t soundOrInstance) {
         if (inst == nullptr)
             return false;
 
-        // Streaming sources can flip to AL_STOPPED for a frame during underrun, so trust the active flag instead (cleared by maUpdate when fully drained).
-        if (inst->streaming)
-            return inst->active;
-
-        return alSourceIsPlaying(inst->alSource);
+        return isInstancePlaying(inst);
     } else {
         // Check if any instance of this sound resource is playing
         repeat(MAX_SOUND_INSTANCES, i) {
             SoundInstance* inst = &ma->instances[i];
             if (!inst->active || inst->soundIndex != soundOrInstance) continue;
-            if (inst->streaming) return true;
-            if (alSourceIsPlaying(inst->alSource)) return true;
+            if (isInstancePlaying(inst)) return true;
         }
         return false;
     }
@@ -819,13 +922,13 @@ static void maPauseSound(AudioSystem* audio, int32_t soundOrInstance) {
     if (isValidSoundInstanceId(soundOrInstance)) {
         SoundInstance* inst = findInstanceById(ma, soundOrInstance);
         if (inst != nullptr) {
-            alSourcePause(inst->alSource);
+            pauseInstance(inst);
         }
     } else {
         repeat(MAX_SOUND_INSTANCES, i) {
             SoundInstance* inst = &ma->instances[i];
             if (inst->active && inst->soundIndex == soundOrInstance) {
-                alSourcePause(inst->alSource);
+                pauseInstance(inst);
             }
         }
     }
@@ -837,13 +940,13 @@ static void maResumeSound(AudioSystem* audio, int32_t soundOrInstance) {
     if (isValidSoundInstanceId(soundOrInstance)) {
         SoundInstance* inst = findInstanceById(ma, soundOrInstance);
         if (inst != nullptr) {
-            alSourcePlay(inst->alSource);
+            startInstance(inst);
         }
     } else {
         repeat(MAX_SOUND_INSTANCES, i) {
             SoundInstance* inst = &ma->instances[i];
             if (inst->active && inst->soundIndex == soundOrInstance) {
-                alSourcePlay(inst->alSource);
+                startInstance(inst);
             }
         }
     }
@@ -854,8 +957,8 @@ static void maPauseAll(AudioSystem* audio) {
 
     repeat(MAX_SOUND_INSTANCES, i) {
         SoundInstance* inst = &ma->instances[i];
-        if (inst->active && alSourceIsPlaying(inst->alSource)) {
-            alSourcePause(inst->alSource);
+        if (inst->active && inst->soundIndex >= 0 && isInstancePlaying(inst)) {
+            pauseInstance(inst);
         }
     }
 }
@@ -865,8 +968,8 @@ static void maResumeAll(AudioSystem* audio) {
 
     repeat(MAX_SOUND_INSTANCES, i) {
         SoundInstance* inst = &ma->instances[i];
-        if (inst->active) {
-            alSourcePlay(inst->alSource);
+        if (inst->active && inst->soundIndex >= 0) {
+            startInstance(inst);
         }
     }
 }
@@ -876,8 +979,8 @@ static void alSuspend(AudioSystem* audio) {
 
     repeat(MAX_SOUND_INSTANCES, i) {
         SoundInstance* inst = &ma->instances[i];
-        if (inst->active && alSourceIsPlaying(inst->alSource)) {
-            alSourcePause(inst->alSource);
+        if (inst->active && isInstancePlaying(inst)) {
+            pauseInstance(inst);
         }
     }
 }
@@ -888,10 +991,8 @@ static void alResume(AudioSystem* audio) {
     repeat(MAX_SOUND_INSTANCES, i) {
         SoundInstance* inst = &ma->instances[i];
         if (!inst->active) continue;
-        ALint state = 0;
-        alGetSourcei(inst->alSource, AL_SOURCE_STATE, &state);
-        if (state == AL_PAUSED) {
-            alSourcePlay(inst->alSource);
+        if (inst->paused) {
+            startInstance(inst);
         }
     }
 }
@@ -1053,19 +1154,64 @@ static float maGetTrackPosition(AudioSystem* audio, int32_t soundOrInstance) {
     return 0.0f;
 }
 
+static void alSeekInstance(SoundInstance* inst, float positionSeconds) {
+    if (!isfinite(positionSeconds) || positionSeconds < 0) return;
+    if (!inst->streaming) {
+        alSourcef(inst->alSource, AL_SEC_OFFSET, positionSeconds);
+        return;
+    }
+    if (inst->streamSampleRate <= 0) return;
+    double requestedFrame = (double) positionSeconds * inst->streamSampleRate;
+    uint64_t frame;
+    if (inst->streamLengthSamples && requestedFrame >= inst->streamLengthSamples) frame = inst->streamLengthSamples - 1;
+    else if (requestedFrame < (double) UINT64_MAX) frame = (uint64_t) requestedFrame;
+    else return;
+    ALint state, queued;
+    alGetSourcei(inst->alSource, AL_SOURCE_STATE, &state);
+    alSourceStop(inst->alSource);
+    alGetSourcei(inst->alSource, AL_BUFFERS_QUEUED, &queued);
+    for (int i = 0; i < queued; i++) {
+        ALuint buffer;
+        alSourceUnqueueBuffers(inst->alSource, 1, &buffer);
+    }
+    alSourceRewind(inst->alSource);
+    if (inst->vorbis) {
+        if (!stb_vorbis_seek((stb_vorbis*) inst->vorbis, (unsigned) frame)) {
+            stb_vorbis_seek_start((stb_vorbis*) inst->vorbis);
+            frame = 0;
+        }
+    } else if (inst->wavFile) {
+        uint64_t bytes = frame * inst->streamChannels * sizeof(int16_t);
+        fseek(inst->wavFile, (long) (inst->wavDataStart + bytes), SEEK_SET);
+        inst->wavSampleBytesRemaining = inst->wavDataBytes - (uint32_t) bytes;
+    }
+    inst->playedSamples = frame;
+    inst->streamEnded = false;
+    queued = 0;
+    for (int i = 0; i < AL_STREAM_BUFFER_COUNT; i++) {
+        if (!streamFillBuffer(inst, inst->streamBuffers[i])) {
+            inst->streamEnded = true;
+            break;
+        }
+        alSourceQueueBuffers(inst->alSource, 1, &inst->streamBuffers[i]);
+        queued++;
+    }
+    if (queued && state == AL_PLAYING) inst->pendingStart = true;
+}
+
 static void maSetTrackPosition(AudioSystem* audio, int32_t soundOrInstance, float positionSeconds) {
     AlAudioSystem* ma = (AlAudioSystem*) audio;
 
     if (isValidSoundInstanceId(soundOrInstance)) {
         SoundInstance* inst = findInstanceById(ma, soundOrInstance);
         if (inst != nullptr) {
-            alSourcef(inst->alSource, AL_SEC_OFFSET, positionSeconds);
+            alSeekInstance(inst, positionSeconds);
         }
     } else {
         repeat(MAX_SOUND_INSTANCES, i) {
             SoundInstance* inst = &ma->instances[i];
             if (inst->active && inst->soundIndex == soundOrInstance) {
-            alSourcef(inst->alSource, AL_SEC_OFFSET, positionSeconds);
+                alSeekInstance(inst, positionSeconds);
             }
         }
     }
@@ -1321,6 +1467,7 @@ AlAudioSystem* AlAudioSystem_create(void) {
     AlAudioSystemVtable.groupIsLoaded = maGroupIsLoaded;
     AlAudioSystemVtable.createStream = maCreateStream;
     AlAudioSystemVtable.destroyStream = maDestroyStream;
+    AlAudioSystemVtable.playEncoded = alPlayEncoded;
     ma->base.vtable = &AlAudioSystemVtable;
     return ma;
 }

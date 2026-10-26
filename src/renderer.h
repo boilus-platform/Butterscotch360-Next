@@ -183,7 +183,7 @@ typedef struct {
     void (*gpuGetColorWriteEnable)(Renderer* renderer, bool* red, bool* green, bool* blue, bool* alpha);
     bool (*gpuGetBlendEnable)(Renderer* renderer);
     // Optional: when enabled, replaces output RGB with the fog color (preserving alpha)
-    void (*gpuSetFog)(Renderer* renderer, bool enable, uint32_t color);
+    void (*gpuSetFog)(Renderer* renderer, bool enable, uint32_t color, float start, float end);
     // Optional: platform-specific tile rendering (nullptr = use default drawSpritePart path)
     void (*drawTile)(Renderer* renderer, RoomTile* tile, float offsetX, float offsetY);
     void (*drawSpriteTiled)(Renderer* renderer, int32_t tpagIndex, float originX, float originY, float x, float y, float xscale, float yscale, bool tileX, bool tileY, float roomW, float roomH, uint32_t color, float alpha);
@@ -236,6 +236,9 @@ typedef struct {
     bool (*shaderIsCompiled)(Renderer* renderer, int32_t shader);
     bool (*shadersSupported)(void);
     void (*setMatrix)(Renderer* renderer, int32_t matrixType, Matrix4f matrix);
+    // Unlit 3D state. State changes flush previously submitted geometry.
+    void (*setDepthState)(Renderer* renderer, bool test, bool write, bool cull);
+    void (*clearDepth)(Renderer* renderer, float depth);
 } RendererVtable;
 
 // ===[ Renderer Base Struct ]===
@@ -261,6 +264,9 @@ struct Renderer {
     bool texFilter;
     BlendFactors blendFactors;
     int32_t cameraCurrent;
+    struct D3DState* d3d;
+    float drawDepth;
+    bool legacyTextureCoordinates;
 };
 
 // ===[ Shared Helpers (platform-agnostic) ]===
@@ -474,6 +480,7 @@ static inline bool Renderer_nineSliceAdjustForTiledPart(DataWin* dw, int32_t spr
 
 // Tiles srcW x srcH pixels from (srcX, srcY) horizontally across dstW pixels starting at (dstX, dstY).
 // Mirror mode flips alternate tiles on the horizontal axis.
+// Keep partial tile sizes fractional; truncating a subpixel remainder to zero would stall the tiling loops.
 static inline void Renderer_nineSliceTileH(Renderer* renderer, int32_t spriteIndex, int32_t subimg, int32_t srcX, int32_t srcY, int32_t srcW, int32_t srcH, float dstX, float dstY, float dstW, uint8_t mode, float angleDeg, float pivotX, float pivotY, uint32_t color, float alpha) {
     if (mode != NS_MIRROR && angleDeg == 0.0f && renderer->vtable->drawTiledPart != nullptr) {
         int32_t tpagIndex, aX = srcX, aY = srcY, aW = srcW, aH = srcH;
@@ -487,13 +494,13 @@ static inline void Renderer_nineSliceTileH(Renderer* renderer, int32_t spriteInd
     int32_t tileIndex = 0;
     while (remaining > 0.0f) {
         bool flipped = (mode == NS_MIRROR) && (tileIndex % 2 == 1);
-        int32_t drawW = ((float) srcW > remaining) ? (int32_t) remaining : srcW;
-        int32_t srcLeft = flipped ? (srcX + srcW - drawW) : srcX;
+        float drawW = ((float) srcW > remaining) ? remaining : (float) srcW;
+        float srcLeft = flipped ? (srcX + srcW - drawW) : (float) srcX;
         float xs = flipped ? -1.0f : 1.0f;
-        float drawX = flipped ? (cursor + (float) drawW) : cursor;
+        float drawX = flipped ? (cursor + drawW) : cursor;
         Renderer_drawSpritePartExt(renderer, spriteIndex, subimg, srcLeft, srcY, drawW, srcH, drawX, dstY, xs, 1.0f, angleDeg, pivotX, pivotY, color, alpha);
-        cursor += (float) drawW;
-        remaining -= (float) drawW;
+        cursor += drawW;
+        remaining -= drawW;
         tileIndex++;
     }
 }
@@ -513,13 +520,13 @@ static inline void Renderer_nineSliceTileV(Renderer* renderer, int32_t spriteInd
     int32_t tileIndex = 0;
     while (remaining > 0.0f) {
         bool flipped = (mode == NS_MIRROR) && (tileIndex % 2 == 1);
-        int32_t drawH = ((float) srcH > remaining) ? (int32_t) remaining : srcH;
-        int32_t srcTop = flipped ? (srcY + srcH - drawH) : srcY;
+        float drawH = ((float) srcH > remaining) ? remaining : (float) srcH;
+        float srcTop = flipped ? (srcY + srcH - drawH) : (float) srcY;
         float ys = flipped ? -1.0f : 1.0f;
-        float drawY = flipped ? (cursor + (float) drawH) : cursor;
+        float drawY = flipped ? (cursor + drawH) : cursor;
         Renderer_drawSpritePartExt(renderer, spriteIndex, subimg, srcX, srcTop, srcW, drawH, dstX, drawY, 1.0f, ys, angleDeg, pivotX, pivotY, color, alpha);
-        cursor += (float) drawH;
-        remaining -= (float) drawH;
+        cursor += drawH;
+        remaining -= drawH;
         tileIndex++;
     }
 }
@@ -538,28 +545,28 @@ static inline void Renderer_nineSliceTile2D(Renderer* renderer, int32_t spriteIn
     int32_t tileRow = 0;
     while (remH > 0.0f) {
         bool flipY = (mode == NS_MIRROR) && (tileRow % 2 == 1);
-        int32_t drawH = ((float) srcH > remH) ? (int32_t) remH : srcH;
-        int32_t srcTop = flipY ? (srcY + srcH - drawH) : srcY;
+        float drawH = ((float) srcH > remH) ? remH : (float) srcH;
+        float srcTop = flipY ? (srcY + srcH - drawH) : (float) srcY;
         float ys = flipY ? -1.0f : 1.0f;
-        float drawY = flipY ? (cursorY + (float) drawH) : cursorY;
+        float drawY = flipY ? (cursorY + drawH) : cursorY;
 
         float cursorX = dstX;
         float remW = dstW;
         int32_t tileCol = 0;
         while (remW > 0.0f) {
             bool flipX = (mode == NS_MIRROR) && (tileCol % 2 == 1);
-            int32_t drawW = (remW < (float) srcW) ? (int32_t) remW : srcW;
-            int32_t srcLeft = flipX ? (srcX + srcW - drawW) : srcX;
+            float drawW = (remW < (float) srcW) ? remW : (float) srcW;
+            float srcLeft = flipX ? (srcX + srcW - drawW) : (float) srcX;
             float xs = flipX ? -1.0f : 1.0f;
-            float drawX = flipX ? (cursorX + (float) drawW) : cursorX;
+            float drawX = flipX ? (cursorX + drawW) : cursorX;
             Renderer_drawSpritePartExt(renderer, spriteIndex, subimg, srcLeft, srcTop, drawW, drawH, drawX, drawY, xs, ys, angleDeg, pivotX, pivotY, color, alpha);
-            cursorX += (float) drawW;
-            remW -= (float) drawW;
+            cursorX += drawW;
+            remW -= drawW;
             tileCol++;
         }
 
-        cursorY += (float) drawH;
-        remH -= (float) drawH;
+        cursorY += drawH;
+        remH -= drawH;
         tileRow++;
     }
 }
